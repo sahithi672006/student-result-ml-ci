@@ -1,4 +1,4 @@
-name: Student Result ML CI-CD
+name: Student Result ML CI
 
 on:
   push:
@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 jobs:
-  train-test-deliver:
+  train-test-containerize:
     runs-on: ubuntu-latest
 
     steps:
@@ -44,7 +44,49 @@ jobs:
         run: python -m unittest test_app.py -v
 
       - name: Build Docker image
-        run: docker build -t student-result-ml:1.0 .
+        run: docker build -t student-result-ml:${{ github.sha }} .
+
+      - name: Start Docker container
+        run: |
+          docker run -d \
+            --name student-result-ml-container \
+            -p 5000:5000 \
+            student-result-ml:${{ github.sha }}
+
+      - name: Wait for application health
+        run: |
+          for i in {1..15}; do
+            if curl --fail --silent http://localhost:5000/health; then
+              echo "Application is healthy."
+              exit 0
+            fi
+
+            echo "Waiting for application... attempt $i"
+            sleep 2
+          done
+
+          echo "Application failed to become healthy."
+          docker logs student-result-ml-container
+          exit 1
+
+      - name: Test prediction endpoint
+        run: |
+          response=$(curl --fail --silent --show-error \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"attendance":90,"internal_marks":85,"assignment_marks":88,"previous_score":80}' \
+            http://localhost:5000/predict)
+
+          echo "Prediction response: $response"
+          echo "$response" | grep -q '"prediction"'
+
+      - name: Show Docker logs
+        if: always()
+        run: docker logs student-result-ml-container || true
+
+      - name: Stop and remove Docker container
+        if: always()
+        run: docker rm -f student-result-ml-container || true
 
       - name: Prepare release candidate
         run: |
@@ -53,7 +95,7 @@ jobs:
           cp student_result_model.pkl release_candidate/
           cp metrics.json release_candidate/
           cp requirements.txt release_candidate/
-          printf 'Student Result Prediction ML Application\nRun: python app.py\nEndpoint: POST /predict\n' > release_candidate/DEPLOYMENT.txt
+          printf 'Student Result Prediction Application\nRun: python app.py\nEndpoint: POST /predict\n' > release_candidate/DEPLOYMENT.txt
 
       - name: Upload release candidate
         uses: actions/upload-artifact@v4
