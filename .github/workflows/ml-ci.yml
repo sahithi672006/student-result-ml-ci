@@ -1,4 +1,3 @@
-
 name: Student Result ML CI-CD
 
 on:
@@ -43,6 +42,7 @@ jobs:
 
       - name: Run prediction application tests
         run: python -m unittest test_app.py -v
+
       - name: Build Docker image
         run: docker build -t student-result-ml:1.0 .
 
