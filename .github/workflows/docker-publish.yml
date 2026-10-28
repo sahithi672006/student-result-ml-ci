@@ -1,0 +1,81 @@
+
+name: Build, Test and Publish Student Result Prediction
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: student-result-prediction
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t student-result-prediction:ci .
+
+      - name: Start test container
+        run: |
+          docker run -d \
+            --name student-result-ci \
+            -p 8000:5000 \
+            student-result-prediction:ci
+
+      - name: Test API health endpoint
+        run: |
+          for attempt in {1..20}; do
+            if curl --fail --silent http://localhost:8000/health; then
+              echo "Health check passed."
+              exit 0
+            fi
+            echo "Waiting for API..."
+            sleep 3
+          done
+          echo "Health check failed."
+          docker logs student-result-ci
+          exit 1
+
+      - name: Test prediction endpoint
+        run: |
+          curl --fail --silent \
+            -X POST http://localhost:8000/predict \
+            -H "Content-Type: application/json" \
+            --data '{"attendance":90,"internal_marks":85,"assignment_marks":88,"previous_score":80}'
+
+      - name: Remove test container
+        if: always()
+        run: docker rm -f student-result-ci || true
+
+      - name: Create lowercase GHCR image name
+        run: |
+          IMAGE_ID="${REGISTRY}/${{ github.repository_owner }}/${IMAGE_NAME}"
+          IMAGE_ID=$(echo "$IMAGE_ID" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE_ID=$IMAGE_ID" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io \
+            -u "${{ github.actor }}" \
+            --password-stdin
+
+      - name: Tag tested image
+        run: |
+          docker tag student-result-prediction:ci "$IMAGE_ID:latest"
+          docker tag student-result-prediction:ci "$IMAGE_ID:sha-${{ github.sha }}"
+
+      - name: Push tested image to GHCR
+        run: |
+          docker push "$IMAGE_ID:latest"
+          docker push "$IMAGE_ID:sha-${{ github.sha }}"
