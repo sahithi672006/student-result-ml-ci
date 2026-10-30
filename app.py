@@ -8,6 +8,14 @@ import uuid
 import joblib
 import pandas as pd
 from flask import Flask, jsonify, request
+from prometheus_client import (
+    Counter,
+    Histogram,
+    Gauge,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+)
+from werkzeug.wrappers import Response
 
 # --------------------------------------------------
 # 1. Initialize Flask Application
@@ -32,7 +40,10 @@ logger = logging.getLogger("student-result-api")
 # 3. Model Configuration
 # --------------------------------------------------
 
-MODEL_PATH = Path(__file__).resolve().parent / "student_result_model.pkl"
+MODEL_PATH = (
+    Path(__file__).resolve().parent
+    / "student_result_model.pkl"
+)
 
 FEATURES = [
     "attendance",
@@ -42,37 +53,76 @@ FEATURES = [
 ]
 
 # --------------------------------------------------
-# 4. Load Machine Learning Model
+# 4. Define Prometheus Metrics
 # --------------------------------------------------
 
+HTTP_REQUESTS = Counter(
+    "student_api_http_requests_total",
+    "Total HTTP requests received by the Student Result Prediction API",
+    ["method", "path", "status"],
+)
+
+HTTP_LATENCY = Histogram(
+    "student_api_http_request_duration_seconds",
+    "HTTP request duration in seconds",
+    ["method", "path"],
+)
+
+PREDICTIONS = Counter(
+    "student_api_predictions_total",
+    "Total Student Result Prediction inference attempts",
+    ["result"],
+)
+
+MODEL_LOADED = Gauge(
+    "student_api_model_loaded",
+    "Whether the Student Result Prediction model is loaded",
+)
+
+# --------------------------------------------------
+# 5. Load Machine Learning Model
+# --------------------------------------------------
+
+_model = None
+
+
 def load_model():
+    global _model
+
+    if _model is not None:
+        return _model
+
     if not MODEL_PATH.exists():
+        MODEL_LOADED.set(0)
+
         logger.error(
             "event=model_load_failed reason=model_file_missing"
         )
 
         raise FileNotFoundError(
-            "student_result_model.pkl was not found. "
-            "Run the training pipeline first."
+            "student_result_model.pkl was not found."
         )
 
     try:
-        model = joblib.load(MODEL_PATH)
+        _model = joblib.load(MODEL_PATH)
+
+        MODEL_LOADED.set(1)
 
         logger.info(
             "event=model_loaded model_file=%s",
             MODEL_PATH.name,
         )
 
-        return model
+        return _model
 
     except Exception:
+        MODEL_LOADED.set(0)
         logger.exception("event=model_load_failed")
         raise
 
 
 # --------------------------------------------------
-# 5. Request Logging Middleware
+# 6. Request Logging and Metrics Middleware
 # --------------------------------------------------
 
 @app.before_request
@@ -95,13 +145,29 @@ def log_request_end(response):
         request, "start_time", time.perf_counter()
     )
 
-    duration_ms = (
-        time.perf_counter() - start_time
-    ) * 1000
+    duration = time.perf_counter() - start_time
+    duration_ms = duration * 1000
+
+    path = request.path
+    method = request.method
+    status = response.status_code
+
+    # Exclude Prometheus scrapes from application traffic metrics.
+    if path != "/metrics":
+        HTTP_REQUESTS.labels(
+            method=method,
+            path=path,
+            status=str(status),
+        ).inc()
+
+        HTTP_LATENCY.labels(
+            method=method,
+            path=path,
+        ).observe(duration)
 
     log_level = (
         logging.WARNING
-        if response.status_code >= 400
+        if status >= 400
         else logging.INFO
     )
 
@@ -112,9 +178,9 @@ def log_request_end(response):
             "method=%s path=%s status=%s duration_ms=%.2f"
         ),
         request_id,
-        request.method,
-        request.path,
-        response.status_code,
+        method,
+        path,
+        status,
         duration_ms,
     )
 
@@ -124,7 +190,7 @@ def log_request_end(response):
 
 
 # --------------------------------------------------
-# 6. Home Endpoint
+# 7. Home Endpoint
 # --------------------------------------------------
 
 @app.get("/")
@@ -138,7 +204,7 @@ def home():
 
 
 # --------------------------------------------------
-# 7. Health Check Endpoint
+# 8. Health Check Endpoint
 # --------------------------------------------------
 
 @app.get("/health")
@@ -151,7 +217,19 @@ def health():
 
 
 # --------------------------------------------------
-# 8. Prediction Endpoint with Error Tracking
+# 9. Prometheus Metrics Endpoint
+# --------------------------------------------------
+
+@app.get("/metrics")
+def metrics():
+    return Response(
+        generate_latest(),
+        content_type=CONTENT_TYPE_LATEST,
+    )
+
+
+# --------------------------------------------------
+# 10. Prediction Endpoint
 # --------------------------------------------------
 
 @app.post("/predict")
@@ -160,7 +238,6 @@ def predict():
         request, "request_id", "unknown"
     )
 
-    # Validate JSON request body
     data = request.get_json(silent=True)
 
     if not isinstance(data, dict) or not data:
@@ -174,7 +251,6 @@ def predict():
             "error": "JSON request body is required",
         }), 400
 
-    # Check required input features
     missing_fields = [
         feature
         for feature in FEATURES
@@ -195,13 +271,11 @@ def predict():
         }), 400
 
     try:
-        # Prepare input data
         sample = pd.DataFrame([{
             feature: data[feature]
             for feature in FEATURES
         }])
 
-        # Load model and make prediction
         model = load_model()
 
         prediction_code = int(
@@ -214,7 +288,8 @@ def predict():
             else "FAIL"
         )
 
-        # Log successful prediction
+        PREDICTIONS.labels(result="success").inc()
+
         logger.info(
             "event=prediction_success request_id=%s",
             request_id,
@@ -226,13 +301,13 @@ def predict():
         }), 200
 
     except Exception:
-        # Log the exception details for debugging
+        PREDICTIONS.labels(result="error").inc()
+
         logger.exception(
             "event=prediction_failed request_id=%s",
             request_id,
         )
 
-        # Return a generic error without exposing internals
         return jsonify({
             "error": "Prediction failed",
             "request_id": request_id,
@@ -240,7 +315,7 @@ def predict():
 
 
 # --------------------------------------------------
-# 9. Start Flask Application
+# 11. Start Flask Application
 # --------------------------------------------------
 
 if __name__ == "__main__":
